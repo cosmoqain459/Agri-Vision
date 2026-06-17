@@ -63,6 +63,9 @@ from security_utils import (
     save_temp_upload,
     validate_image_upload,
 )
+from auth.authorization import require_role, require_any_role, require_permission
+from models import Role, Permission, RolePermission, UserRole
+
 
 load_dotenv()
 
@@ -367,7 +370,8 @@ class ModelManager:
                             RESNET_MODEL_PATH,
                             map_location=torch.device("cpu"),
                         )
-                    except Exception:
+                    except (RuntimeError, torch.serialization.PickleError) as exc:
+                        logger.debug(f"ResNet50 with weights_only=True failed, retrying with weights_only=False: {exc}")
                         self.resnet_model = torch.load(
                             RESNET_MODEL_PATH,
                             map_location=torch.device("cpu"),
@@ -376,9 +380,13 @@ class ModelManager:
                     self.resnet_model.eval()
                     self.errors["resnet"] = None
                     logger.info("ResNet50 model loaded successfully")
+                except (FileNotFoundError, RuntimeError, TypeError) as exc:
+                    self.errors["resnet"] = str(exc)
+                    logger.error(f"ResNet50 model failed to load from {RESNET_MODEL_PATH}: {exc}")
+                    self.resnet_model = None
                 except Exception as exc:
                     self.errors["resnet"] = str(exc)
-                    logger.warning(f"ResNet50 model not found or failed to load: {exc}")
+                    logger.exception(f"Unexpected error loading ResNet50 model: {exc}")
                     self.resnet_model = None
 
             if self.yolo_model is None:
@@ -840,7 +848,14 @@ def read_validated_upload_image(file_storage) -> Tuple[str, np.ndarray, np.ndarr
     try:
         img = Image.open(BytesIO(file_bytes))
         img.verify()
-    except Exception:
+    except (IOError, OSError, ValueError) as e:
+        logger.warning(f"Image validation failed during PIL verify: {e}")
+        raise UploadValidationError(
+            "Unable to process this image. It may be corrupt or in an unsupported format.",
+            status_code=400,
+        )
+    except Exception as e:
+        logger.exception(f"Unexpected error during image verification: {e}")
         raise UploadValidationError(
             "Unable to process this image. It may be corrupt or in an unsupported format.",
             status_code=400,
@@ -1193,10 +1208,8 @@ def stories():
 
 @app.route("/model-admin")
 @login_required
+@require_any_role(['researcher', 'admin'])
 def admin_dashboard():
-    if not current_user.is_researcher():
-        flash('Access denied. Researchers and Admins only.', 'danger')
-        return redirect(url_for('index'))
     return render_template("admin.html")
 
 
@@ -3764,3 +3777,35 @@ if __name__ == '__main__':
     
     is_debug = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")
     app.run(debug=is_debug, host="0.0.0.0", port=5000)
+
+# --- RBAC Management APIs ---
+
+@app.route('/api/admin/roles', methods=['GET', 'POST'])
+@login_required
+@require_role('admin')
+def api_admin_roles():
+    from auth.audit_log import log_audit_event
+    if request.method == 'POST':
+        data = request.get_json()
+        role = Role(name=data['name'], slug=data['slug'], description=data.get('description'))
+        db.session.add(role)
+        db.session.commit()
+        log_audit_event("ROLE_CREATED", f"Role {role.slug} created", user_id=current_user.id)
+        return jsonify({"status": "success", "id": role.id})
+    roles = Role.query.filter_by(deleted_at=None).all()
+    return jsonify([{"id": r.id, "name": r.name, "slug": r.slug} for r in roles])
+
+@app.route('/api/admin/permissions', methods=['GET', 'POST'])
+@login_required
+@require_role('admin')
+def api_admin_permissions():
+    from auth.audit_log import log_audit_event
+    if request.method == 'POST':
+        data = request.get_json()
+        perm = Permission(name=data['name'], slug=data['slug'])
+        db.session.add(perm)
+        db.session.commit()
+        log_audit_event("PERMISSION_CREATED", f"Permission {perm.slug} created", user_id=current_user.id)
+        return jsonify({"status": "success", "id": perm.id})
+    perms = Permission.query.all()
+    return jsonify([{"id": p.id, "name": p.name, "slug": p.slug} for p in perms])
